@@ -7,6 +7,10 @@
 <p align="center"><strong>Save your favourite terminal commands and bring them back with one shortcut key.</strong></p>
 
 <p align="center">
+  <img src="docs/assets/demo.gif" alt="quickcommands demo: press Ctrl+Q, save a command with Ctrl+S, then find it and run it" width="100%" />
+</p>
+
+<p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/github/license/arifislam-me/quickcommands?style=for-the-badge&label=License" alt="License" /></a>
   <a href="https://github.com/arifislam-me/quickcommands/releases/latest"><img src="https://img.shields.io/github/v/release/arifislam-me/quickcommands?style=for-the-badge&label=Release" alt="Latest release" /></a>
   <img src="https://img.shields.io/badge/platform-Ubuntu%20%7C%20Debian-lightgrey?style=for-the-badge" alt="Platform: Ubuntu and Debian" />
