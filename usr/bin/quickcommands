@@ -1,0 +1,455 @@
+#!/usr/bin/env bash
+# quickcommands - save terminal commands and pick them from an fzf menu.
+
+VERSION="1.0.0"
+SAVE_FILE="$HOME/.saved_commands"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/quickcommands"
+CONFIG_FILE="$CONFIG_DIR/config"
+DEFAULT_KEY='\C-q'
+PLACEHOLDER="No commands found. Write your first command and press Ctrl+S"
+
+RE_CTRL='^\\C-([a-zA-Z])$'
+# Lowercase only: \eO (and \e[) start arrow/function-key sequences in many terminals.
+RE_ALT='^\\e([a-z0-9])$'
+
+err() { printf '%s\n' "$*" >&2; exit 1; }
+
+show_help() {
+  cat << EOF
+QuickCommands $VERSION - Smart command manager for terminal productivity
+
+Usage:
+  quickcommands <command> [args]
+  Ctrl+Q                      # Interactive menu (default key, configurable)
+
+Commands:
+  pick                        # Interactive picker, prints the chosen command
+  save <command>              # Save a command
+  list                        # List all saved commands (numbered)
+  run <index>                 # Run command by index number
+  delete                      # Interactive command deletion
+  edit                        # Edit commands file directly
+  rm <index>                  # Remove command by index
+  clear                       # Clear all commands
+  key                         # Show the current shortcut key
+  key set <key>               # Change the shortcut (ctrl-<letter>, alt-<letter>, or \\C-g)
+  key reset                   # Back to the default key (ctrl-q)
+  path                        # Print the save-file path
+  help                        # Show this help
+  --version                   # Print the version
+
+Examples:
+  quickcommands save "git status"
+  quickcommands save docker ps -a
+  quickcommands list
+  quickcommands run 1
+  quickcommands key set ctrl-g
+  quickcommands key set alt-x
+  @commands                   # Pick a command, then press Up to use it
+
+Interactive menu (default Ctrl+Q):
+  Up/Down                     Navigate commands
+  Enter                       SELECT: put the command in your terminal
+  Ctrl+S                      Save what you typed
+  Ctrl+D                      Delete selected command (asks to confirm)
+  Esc / Ctrl+C                Cancel
+
+Changing the key:
+  The key is read when a terminal starts. After 'key set' or 'key reset',
+  open a NEW terminal (or run: source ~/.bashrc). A child process cannot
+  rebind the shell that is already running.
+  Config file: $CONFIG_FILE   (line: KEY=\\C-q)
+  The environment variable QUICKCOMMANDS_KEY overrides the config file.
+  Keys that would break the terminal (ctrl-c, ctrl-d, ctrl-z, ctrl-s, ctrl-m,
+  ctrl-j, ctrl-i, ctrl-h, ctrl-[) are refused.
+
+Commands are stored in: $SAVE_FILE
+EOF
+}
+
+# ---------------------------------------------------------------- storage
+
+ensure_file() {
+  if [[ ! -e "$SAVE_FILE" ]]; then
+    # Very first run only: seed two example commands.
+    ( umask 077; printf '%s\n' 'echo hello' 'whoami' > "$SAVE_FILE" )
+  fi
+  [[ -f "$SAVE_FILE" ]] && chmod 600 "$SAVE_FILE" 2>/dev/null
+  return 0
+}
+
+trim() {
+  local s=$1
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+line_count() { awk 'END { print NR }' "$SAVE_FILE"; }
+
+# Validate an index; dies with a clear message when bad.
+check_index() {
+  local idx=$1 count
+  [[ "$idx" =~ ^[1-9][0-9]*$ ]] || err "Invalid index '$idx': use a positive whole number (see: quickcommands list)"
+  count=$(line_count)
+  if (( ${#idx} > 9 )) || (( 10#$idx > count )); then
+    err "No command at index $idx (you have $count)"
+  fi
+}
+
+line_at() { awk -v n="$1" 'NR == n { print; exit }' "$SAVE_FILE"; }
+
+# Replace the save file with $1 (a temp file we created), keep mode 600.
+commit_tmp() {
+  chmod 600 "$1" && mv -f "$1" "$SAVE_FILE"
+}
+
+delete_index() {
+  local tmp
+  tmp=$(mktemp "${SAVE_FILE}.XXXXXX") || err "Cannot create temp file"
+  awk -v n="$1" 'NR != n' "$SAVE_FILE" > "$tmp" || { rm -f "$tmp"; err "Delete failed"; }
+  commit_tmp "$tmp"
+}
+
+# Delete every line that is exactly equal to $1.
+delete_exact() {
+  local tmp
+  tmp=$(mktemp "${SAVE_FILE}.XXXXXX") || err "Cannot create temp file"
+  # grep -v exits 1 when nothing is left; that is fine.
+  grep -vxF -- "$1" "$SAVE_FILE" > "$tmp" || true
+  commit_tmp "$tmp"
+}
+
+# add_command <text>: silent. Returns 0 saved, 2 duplicate, 3 empty, 4 newline.
+add_command() {
+  local cmd
+  [[ "$1" == *$'\n'* ]] && return 4
+  cmd=$(trim "$1")
+  [[ -n "$cmd" ]] || return 3
+  ensure_file
+  grep -qxF -- "$cmd" "$SAVE_FILE" 2>/dev/null && return 2
+  printf '%s\n' "$cmd" >> "$SAVE_FILE"
+  return 0
+}
+
+# ---------------------------------------------------------------- picker
+
+pick_cmd() {
+  ensure_file
+  command -v fzf >/dev/null 2>&1 || err "fzf not found. Install with: sudo apt install fzf"
+
+  QC_TMP=$(mktemp -d) || err "Cannot create temp directory"
+  export QC_TMP
+  trap 'rm -rf "$QC_TMP"' EXIT
+  trap 'exit 130' INT TERM
+
+  local save_f="$QC_TMP/save" del_f="$QC_TMP/delete"
+  local content sel rc typed target conf
+
+  while :; do
+    rm -f "$save_f" "$del_f"
+    content=$(grep -v '^[[:space:]]*$' "$SAVE_FILE" 2>/dev/null || true)
+    [[ -n "$content" ]] || content=$PLACEHOLDER
+
+    rc=0
+    # fzf draws its UI on /dev/tty, so stdout stays free for the result.
+    sel=$(printf '%s\n' "$content" | SHELL=/bin/sh fzf \
+      --prompt="COMMANDS> " \
+      --header="Type to search | Enter: SELECT | Ctrl+S: SAVE typed text | Ctrl+D: DELETE selected | Esc: Cancel" \
+      --no-multi \
+      --bind='ctrl-s:execute-silent(printf '"'%s\n'"' {q} > "$QC_TMP/save")+abort' \
+      --bind='ctrl-d:execute-silent(printf '"'%s\n'"' {} > "$QC_TMP/delete")+abort') || rc=$?
+
+    if (( rc == 0 )); then
+      [[ -n "$sel" && "$sel" != "$PLACEHOLDER" ]] || continue
+      printf '%s\n' "$sel"
+      return 0
+    fi
+
+    if [[ -f "$save_f" ]]; then
+      typed=$(cat "$save_f")
+      add_command "$typed" >/dev/null
+      continue
+    fi
+
+    if [[ -f "$del_f" ]]; then
+      target=$(cat "$del_f")
+      if [[ -n "$target" && "$target" != "$PLACEHOLDER" ]]; then
+        conf=$(printf '%s\n' 'NO - Keep' 'YES - Delete' | SHELL=/bin/sh fzf \
+          --prompt="DELETE> " \
+          --header="Delete this command?  $target" \
+          --no-multi) || continue
+        [[ "$conf" == "YES - Delete" ]] && delete_exact "$target"
+      fi
+      continue
+    fi
+
+    return 0   # Esc / Ctrl+C: cancel, print nothing
+  done
+}
+
+# ---------------------------------------------------------------- commands
+
+save_cmd() {
+  local arg cmd rc
+  [[ $# -gt 0 ]] || err "Provide a command to save"
+  for arg in "$@"; do
+    [[ "$arg" == *$'\n'* ]] && err "Cannot save a command that contains a newline"
+  done
+  if (( $# == 1 )); then
+    cmd=$1                       # common case: save "git status"
+  else
+    printf -v cmd '%q ' "$@"     # keep quoting: save grep "a b"
+  fi
+  cmd=$(trim "$cmd")
+  add_command "$cmd"; rc=$?
+  case $rc in
+    0) printf '%s\n' "✓ Saved: $cmd" ;;
+    2) printf '%s\n' "⚠ Command already saved: $cmd" ;;
+    3) err "Cannot save empty command" ;;
+    *) err "Cannot save this command" ;;
+  esac
+}
+
+list_cmd() {
+  ensure_file
+  nl -ba -w2 -s". " "$SAVE_FILE"
+}
+
+run_index() {
+  ensure_file
+  local idx="${1:-}" cmd
+  [[ -n "$idx" ]] || err "Index required"
+  check_index "$idx"
+  cmd=$(line_at "$idx")
+  [[ -n "$cmd" ]] || err "No command at index $idx"
+  printf '%s\n' "> $cmd"
+  eval "$cmd"
+}
+
+rm_cmd() {
+  ensure_file
+  local idx="${1:-}"
+  [[ -n "$idx" ]] || err "Index required"
+  check_index "$idx"
+  delete_index "$idx"
+  printf '%s\n' "Removed entry $idx"
+}
+
+edit_cmd() { ensure_file; "${EDITOR:-nano}" "$SAVE_FILE"; ensure_file; }
+
+delete_cmd() {
+  ensure_file
+  command -v fzf >/dev/null 2>&1 || err "fzf not found. Install with: sudo apt install fzf"
+  local selected num cmd_text confirm
+  selected=$(nl -ba -w2 -s". " "$SAVE_FILE" | fzf --prompt="DELETE> " \
+    --header="Select command to DELETE (ESC to cancel)") || true
+  [[ -n "$selected" ]] || { printf '%s\n' "Cancelled"; exit 0; }
+
+  num=${selected%%.*}; num=${num// /}
+  cmd_text=${selected#*. }
+  check_index "$num"
+
+  printf '%s\n' "Delete this command? $cmd_text"
+  printf '%s' "Type 'y' to confirm: "
+  read -r confirm || confirm=
+  if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+    delete_index "$num"
+    printf '%s\n' "✓ Deleted: $cmd_text"
+  else
+    printf '%s\n' "Cancelled"
+  fi
+}
+
+clear_cmd() {
+  ensure_file
+  local count confirm
+  count=$(line_count)
+  printf '%s\n' "This will delete ALL $count saved commands."
+  printf '%s' "Type 'yes' to confirm: "
+  read -r confirm || confirm=
+  if [[ "$confirm" == "yes" ]]; then
+    : > "$SAVE_FILE"
+    printf '%s\n' "✓ All commands cleared"
+  else
+    printf '%s\n' "Cancelled"
+  fi
+}
+
+# ---------------------------------------------------------------- key config
+
+describe_key() {
+  local k=$1
+  if [[ "$k" =~ $RE_CTRL ]]; then
+    printf 'ctrl-%s' "${BASH_REMATCH[1],,}"
+  elif [[ "$k" =~ $RE_ALT ]]; then
+    printf 'alt-%s' "${BASH_REMATCH[1]}"
+  else
+    printf '%s' "$k"
+  fi
+}
+
+# Why a ctrl-<letter> must not be used (empty when it is allowed).
+reserved_reason() {
+  case $1 in
+    c) printf 'Ctrl+C sends the interrupt signal; it must keep working.' ;;
+    d) printf 'Ctrl+D ends input and closes the shell.' ;;
+    z) printf 'Ctrl+Z suspends the running program.' ;;
+    s) printf 'Ctrl+S is terminal flow control (it freezes the output).' ;;
+    m) printf 'Ctrl+M is the same as Enter.' ;;
+    j) printf 'Ctrl+J is a newline, the same as Enter.' ;;
+    i) printf 'Ctrl+I is the Tab key (completion).' ;;
+    h) printf 'Ctrl+H is Backspace.' ;;
+    '[') printf 'Ctrl+[ is the Escape key; many other keys start with it.' ;;
+  esac
+}
+
+# What a ctrl-<letter> normally does in bash (empty when nothing common).
+warn_reason() {
+  case $1 in
+    a) printf 'move to start of line' ;;
+    e) printf 'move to end of line' ;;
+    r) printf 'reverse history search' ;;
+    l) printf 'clear the screen' ;;
+    w) printf 'delete the previous word' ;;
+    u) printf 'delete to start of line' ;;
+    k) printf 'delete to end of line' ;;
+    b) printf 'move back one character' ;;
+    f) printf 'move forward one character' ;;
+    p) printf 'previous history entry' ;;
+    n) printf 'next history entry' ;;
+    y) printf 'paste (yank) deleted text' ;;
+    t) printf 'swap two characters' ;;
+  esac
+}
+
+# parse_key <text>. Sets KEY_RAW (+ KEY_WARN). Returns 0 ok, 1 invalid, 2 refused.
+parse_key() {
+  local in=$1 lc letter="" why
+  KEY_RAW=""; KEY_WARN=""; KEY_ERR=""
+  if [[ -z "${in//[[:space:]]/}" ]]; then
+    KEY_ERR="The key is empty. Use ctrl-<letter>, alt-<letter> or a readline sequence like \\C-g."
+    return 1
+  fi
+  lc=${in,,}
+
+  if [[ "$lc" =~ ^(ctrl|control)[-+](.)$ ]]; then
+    letter=${BASH_REMATCH[2]}
+    if [[ "$letter" == "[" ]]; then
+      :
+    elif [[ ! "$letter" =~ ^[a-z]$ ]]; then
+      KEY_ERR="Unsupported key '$in'. Use ctrl-<letter>, alt-<letter> or a readline sequence like \\C-g."
+      return 1
+    fi
+  elif [[ "$lc" =~ ^alt[-+]([a-z])$ ]]; then
+    KEY_RAW="\\e${BASH_REMATCH[1]}"
+    return 0
+  elif [[ "$in" =~ $RE_CTRL ]]; then
+    letter=${BASH_REMATCH[1],,}
+  elif [[ "$in" =~ $RE_ALT ]]; then
+    KEY_RAW=$in
+    return 0
+  elif [[ "$in" == '\C-[' ]]; then
+    letter="["
+  else
+    KEY_ERR="Unsupported key '$in'. Use ctrl-<letter>, alt-<letter> or a readline sequence like \\C-g or \\ex."
+    return 1
+  fi
+
+  why=$(reserved_reason "$letter")
+  if [[ -n "$why" ]]; then
+    KEY_ERR="Refused: ctrl-$letter would break your terminal or shell. $why Pick another key."
+    return 2
+  fi
+  KEY_RAW="\\C-$letter"
+  why=$(warn_reason "$letter")
+  [[ -n "$why" ]] && KEY_WARN="ctrl-$letter normally does: $why. quickcommands will replace that in new terminals ('quickcommands key reset' undoes it)."
+  return 0
+}
+
+# Sets EFF_RAW, EFF_SRC, EFF_NOTE.
+effective_key() {
+  local raw="" line src=""
+  EFF_NOTE=""
+  if [[ -n "${QUICKCOMMANDS_KEY:-}" ]]; then
+    raw=$QUICKCOMMANDS_KEY; src="environment variable QUICKCOMMANDS_KEY"
+  elif [[ -r "$CONFIG_FILE" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      case $line in KEY=*) raw=${line#KEY=}; src="config file $CONFIG_FILE"; break ;; esac
+    done < "$CONFIG_FILE"
+  fi
+  if [[ -z "$raw" ]]; then
+    EFF_RAW=$DEFAULT_KEY; EFF_SRC="default"; return 0
+  fi
+  # Only raw readline sequences are valid in the config; same rule as profile.d.
+  if [[ ( "$raw" =~ $RE_CTRL || "$raw" =~ $RE_ALT ) ]] && parse_key "$raw"; then
+    EFF_RAW=$KEY_RAW; EFF_SRC=$src
+  else
+    EFF_RAW=$DEFAULT_KEY; EFF_SRC="default"
+    EFF_NOTE="Ignored invalid or unsafe key '$raw' from $src."
+  fi
+}
+
+key_show() {
+  effective_key
+  printf 'Current key: %s (readline: %s)\n' "$(describe_key "$EFF_RAW")" "$EFF_RAW"
+  printf 'Source: %s\n' "$EFF_SRC"
+  [[ -n "$EFF_NOTE" ]] && printf '%s\n' "$EFF_NOTE"
+  return 0
+}
+
+applies_note() {
+  printf '%s\n' "This applies in NEW terminals, or after: source ~/.bashrc"
+  printf '%s\n' "(A command cannot rebind the shell that is already running.)"
+  if [[ -n "${QUICKCOMMANDS_KEY:-}" ]]; then
+    printf '%s\n' "Note: QUICKCOMMANDS_KEY is set in your environment and overrides the config file."
+  fi
+}
+
+key_set() {
+  [[ $# -eq 1 ]] || err "Usage: quickcommands key set <key>   (e.g. ctrl-g, alt-x, \\C-g)"
+  parse_key "$1"
+  case $? in
+    1|2) err "$KEY_ERR" ;;
+  esac
+  [[ -n "$KEY_WARN" ]] && printf '%s\n' "Warning: $KEY_WARN" >&2
+  ( umask 077; mkdir -p "$CONFIG_DIR" ) || err "Cannot create $CONFIG_DIR"
+  chmod 700 "$CONFIG_DIR" 2>/dev/null
+  ( umask 077; printf 'KEY=%s\n' "$KEY_RAW" > "$CONFIG_FILE" ) || err "Cannot write $CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE" 2>/dev/null
+  printf 'Key set to %s (readline: %s)\n' "$(describe_key "$KEY_RAW")" "$KEY_RAW"
+  applies_note
+}
+
+key_reset() {
+  rm -f "$CONFIG_FILE"
+  printf 'Key reset to the default: %s\n' "$(describe_key "$DEFAULT_KEY")"
+  applies_note
+}
+
+key_cmd() {
+  case "${1:-}" in
+    "") key_show ;;
+    set) shift; key_set "$@" ;;
+    reset) key_reset ;;
+    *) err "Usage: quickcommands key [set <key> | reset]" ;;
+  esac
+}
+
+# ---------------------------------------------------------------- dispatcher
+
+case "${1:-pick}" in
+  pick|p) pick_cmd ;;
+  save|s) shift; save_cmd "$@" ;;
+  list|l) list_cmd ;;
+  run) shift; run_index "${1:-}" ;;
+  delete|d) delete_cmd ;;
+  edit|e) edit_cmd ;;
+  rm) shift; rm_cmd "${1:-}" ;;
+  clear|c) clear_cmd ;;
+  key|k) shift; key_cmd "$@" ;;
+  path) printf '%s\n' "$SAVE_FILE" ;;
+  --version|-V|version) printf 'quickcommands %s\n' "$VERSION" ;;
+  help|h|--help|-h) show_help ;;
+  *) err "Unknown command: $1. Use 'quickcommands help' for usage." ;;
+esac

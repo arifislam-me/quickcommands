@@ -1,0 +1,40 @@
+#!/bin/sh
+# quickcommands postinst: make interactive bash shells load the profile script.
+# Appends one marked block to ~/.bashrc of real users (uid >= 1000) and root.
+# Never fails the installation because of a bashrc problem.
+set -e
+
+[ "$1" = "configure" ] || exit 0
+
+BEGIN='# >>> quickcommands >>>'
+END='# <<< quickcommands <<<'
+OLD='source /etc/profile.d/quickcommands.sh'
+
+add_block() {
+    rc="$1/.bashrc"
+    [ -f "$rc" ] && [ ! -L "$rc" ] || return 0
+    # Already installed (v1.1+ block, or v1.0.x plain line): do not add a second copy.
+    if grep -qF -e "$BEGIN" -e "$OLD" "$rc" 2>/dev/null; then
+        return 0
+    fi
+    {
+        printf '\n%s\n' "$BEGIN"
+        printf '%s\n' '[ -r /etc/profile.d/quickcommands.sh ] && . /etc/profile.d/quickcommands.sh'
+        printf '%s\n' "$END"
+    } >> "$rc"
+}
+
+getent passwd | while IFS=: read -r _name _pw uid _gid _gecos home _shell; do
+    case "$uid" in ''|*[!0-9]*) continue ;; esac
+    if [ "$uid" -ge 1000 ] || [ "$uid" -eq 0 ]; then
+        [ -d "$home" ] || continue
+        add_block "$home" || true
+    fi
+done || true
+
+echo "quickcommands installed."
+echo "  Open a new terminal, then press Ctrl+Q to pick a saved command."
+echo "  Change the key with: quickcommands key set ctrl-g   (or alt-x, \\C-g)"
+echo "  Ctrl+R keeps working as the normal history search."
+echo "  Help: quickcommands --help"
+exit 0

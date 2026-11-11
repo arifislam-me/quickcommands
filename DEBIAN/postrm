@@ -1,0 +1,13 @@
+#!/bin/sh
+# quickcommands postrm: messages only. bashrc cleanup is done in prerm.
+# Saved commands (~/.saved_commands) are never deleted, not even on purge.
+set -e
+
+case "$1" in
+    remove|purge)
+        echo "quickcommands removed."
+        echo "Your saved commands (~/.saved_commands) were kept. Delete that file yourself if you want."
+        echo "Open a new terminal to finish the removal."
+        ;;
+esac
+exit 0

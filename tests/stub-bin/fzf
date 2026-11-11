@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Fake fzf for tests. One action per fzf call, read from the file $FZF_STUB_PLAN
+# (call counter kept in $FZF_STUB_STATE). Actions:
+#   print:<text>   print <text> and exit 0 (user pressed Enter on it)
+#   grep:<text>    print the first stdin line containing <text>, exit 0
+#   cancel         exit 130 (Esc / Ctrl+C); also used when the plan runs out
+#   save:<query>   run the real ctrl-s bind command with {q}=<query>, exit 130
+#   delete:<line>  run the real ctrl-d bind command with {}=<line>, exit 130
+# Everything fzf reads on stdin is appended to $FZF_STUB_STDIN (if set).
+# Passing arguments are appended to $FZF_STUB_ARGS (if set).
+
+stdin_data=$(cat)
+[[ -n "${FZF_STUB_STDIN:-}" ]] && printf '%s\n' "$stdin_data" >> "$FZF_STUB_STDIN"
+[[ -n "${FZF_STUB_ARGS:-}" ]] && printf '%s\n' "$*" >> "$FZF_STUB_ARGS"
+
+bind_s="" bind_d=""
+for a in "$@"; do
+  case $a in
+    --bind=ctrl-s:*) bind_s=${a#--bind=ctrl-s:} ;;
+    --bind=ctrl-d:*) bind_d=${a#--bind=ctrl-d:} ;;
+  esac
+done
+
+n=0
+[[ -f "${FZF_STUB_STATE:-}" ]] && n=$(cat "$FZF_STUB_STATE")
+n=$((n + 1))
+printf '%s' "$n" > "$FZF_STUB_STATE"
+action=$(sed -n "${n}p" "${FZF_STUB_PLAN:-/dev/null}")
+[[ -n "$action" ]] || action=cancel
+
+shq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+
+run_bind() { # <bind text> <replacement for {q} / {}>
+  local b=$1 val c
+  val=$(shq "$2")
+  b=${b#execute-silent(}
+  b=${b%)+abort}
+  c=${b//\{q\}/"$val"}
+  c=${c//\{\}/"$val"}
+  sh -c "$c"
+}
+
+case $action in
+  print:*) printf '%s\n' "${action#print:}"; exit 0 ;;
+  grep:*)  printf '%s\n' "$stdin_data" | grep -F -m1 -- "${action#grep:}"; exit 0 ;;
+  save:*)  run_bind "$bind_s" "${action#save:}"; exit 130 ;;
+  delete:*) run_bind "$bind_d" "${action#delete:}"; exit 130 ;;
+  *) exit 130 ;;
+esac

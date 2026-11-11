@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="quickcommands logo: saved prompt bookmark">
+  <rect x="16" y="16" width="224" height="224" rx="56" fill="#0F1B2D"/>
+  <path d="M82 40 H174 Q186 40 186 52 V214 L128 174 L70 214 V52 Q70 40 82 40 Z" fill="#FFB000"/>
+  <path d="M100 84 L128 108 L100 132" fill="none" stroke="#0F1B2D" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+  <line x1="138" y1="136" x2="158" y2="136" stroke="#0F1B2D" stroke-width="16" stroke-linecap="round"/>
+</svg>

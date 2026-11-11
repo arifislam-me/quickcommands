@@ -1,0 +1,40 @@
+#!/bin/sh
+# quickcommands prerm.
+# Cleanup lives here (not in postrm) and runs ONLY on "remove": upgrades,
+# failed upgrades and deconfigure must leave users' bashrc untouched. dpkg
+# calls "prerm remove" for both "dpkg -r" and "dpkg -P", so purge is covered.
+# Only exact lines of ours are deleted; nothing else in the file is edited.
+set -e
+
+[ "$1" = "remove" ] || exit 0
+
+BEGIN='^# >>> quickcommands >>>$'
+END='^# <<< quickcommands <<<$'
+
+clean_rc() {
+    rc="$1/.bashrc"
+    [ -f "$rc" ] && [ ! -L "$rc" ] && [ -w "$rc" ] || return 0
+    tmp=$(mktemp) || return 0
+    cp "$rc" "$tmp"
+    # Marked block, only if it is complete (never delete to end of file).
+    if grep -q "$BEGIN" "$tmp" && grep -q "$END" "$tmp"; then
+        sed -i "/$BEGIN/,/$END/d" "$tmp"
+    fi
+    # Old v1.0.x lines, exact matches only.
+    sed -i -e '/^# Added by quickcommands package$/d' \
+           -e '/^source \/etc\/profile\.d\/quickcommands\.sh$/d' "$tmp"
+    # Write back in place only when something changed (keeps owner and mode).
+    if ! cmp -s "$rc" "$tmp"; then
+        cat "$tmp" > "$rc" || true
+    fi
+    rm -f "$tmp"
+}
+
+getent passwd | while IFS=: read -r _name _pw uid _gid _gecos home _shell; do
+    case "$uid" in ''|*[!0-9]*) continue ;; esac
+    if [ "$uid" -ge 1000 ] || [ "$uid" -eq 0 ]; then
+        [ -d "$home" ] || continue
+        clean_rc "$home" || true
+    fi
+done || true
+exit 0

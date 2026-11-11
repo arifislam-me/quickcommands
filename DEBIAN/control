@@ -1,0 +1,13 @@
+Package: quickcommands
+Version: 1.0.0
+Section: utils
+Priority: optional
+Architecture: all
+Depends: bash, fzf
+Maintainer: Arif Islam <arifislam.swe@gmail.com>
+Homepage: https://github.com/arifislam-me/quickcommands
+Description: Smart command manager for terminal productivity
+ Save terminal commands and pick them from an fzf menu. Press Ctrl+Q
+ (configurable with "quickcommands key set") to search, Ctrl+S to save and
+ Ctrl+D to delete; the chosen command is placed on the command line.
+ Works with bash only.
